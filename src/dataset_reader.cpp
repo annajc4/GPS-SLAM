@@ -133,6 +133,7 @@ torch::Tensor Camera::loadDepth(float downscale_factor, float depth_scale)
 
 std::string Camera::getFrameID(std::string prefix, std::string suffix) const
 {
+    if (suffix == ".jpg" && fs::path(imgFilePath).extension() == ".png") suffix = ".png";
     // 找到前缀的位置
     size_t startPos = imgFilePath.find(prefix);
     if (startPos != std::string::npos)
@@ -317,7 +318,9 @@ void DatasetReader::read()
 
         std::string filename = idToFilename(frame_id);
         std::string pose_filename = (posePath / ("pose" + filename + ".txt")).string();
-        std::string img_filename = (imagePath / ("frame" + filename + ".jpg")).string();
+        // GPS_COMPARE: lossless preprocessed RGB
+        const std::string image_ext = config["image_extension"] ? config["image_extension"].as<std::string>() : ".jpg";
+        std::string img_filename = (imagePath / ("frame" + filename + image_ext)).string();
         std::string depth_filename = (depthPath / ("depth" + filename + ".png")).string();
         if (!fs::exists(pose_filename))
             throw std::runtime_error(pose_filename + " does not exist");

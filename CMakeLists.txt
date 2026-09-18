@@ -4,7 +4,8 @@ project(opensplat)
 set(GPU_RUNTIME "CUDA" )
 set(OPENSPLAT_MAX_CUDA_COMPATIBILITY OFF CACHE BOOL "Build for maximum CUDA device compatibility")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-set(CMAKE_PREFIX_PATH ${PROJECT_SOURCE_DIR}/ThirdLibs/libtorch ${PROJECT_SOURCE_DIR}/ThirdLibs/install)
+list(PREPEND CMAKE_PREFIX_PATH "${GPS_TORCH_ROOT}" "${GPS_DEPS_PREFIX}")
+include_directories("${GPS_DEPS_PREFIX}/include" "${GPS_NATIVE_PREFIX}/include")
 
 # Read version
 file(READ "VERSION" APP_VERSION)
@@ -109,7 +110,7 @@ else()
     endif()
     # Set torch cuda architecture list
     set(TORCH_CUDA_ARCH_LIST ${CMAKE_CUDA_ARCHITECTURES})
-    list(TRANSFORM TORCH_CUDA_ARCH_LIST REPLACE "([0-9])([0-9])" "\\1.\\2")
+    list(TRANSFORM TORCH_CUDA_ARCH_LIST REPLACE "^([0-9]+)([0-9])$" "\\1.\\2")
     string(REPLACE ";" " " TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}")
     message(STATUS "** Updated TORCH_CUDA_ARCH_LIST to ${TORCH_CUDA_ARCH_LIST} **")
 endif()
@@ -136,17 +137,17 @@ find_package(OpenCV REQUIRED)
 set(OpenCV_LIBS opencv_core opencv_imgproc opencv_highgui opencv_calib3d)
 
 ##################### My LIBS ############################
-set(THIRDLIBS_DIR "${CMAKE_SOURCE_DIR}/ThirdLibs/install/lib")
+set(THIRDLIBS_DIR "${GPS_DEPS_PREFIX}/lib")
 link_directories(${THIRDLIBS_DIR})
 
 # yaml-cpp
-set(YAML_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/ThirdLibs/install/include/yaml-cpp")
+set(YAML_INCLUDE_DIR "${GPS_DEPS_PREFIX}/include/yaml-cpp")
 
 # tensorboard_logger
 find_package(Protobuf REQUIRED)
-set(TENSORBOARD_LOGGER_DIR "${CMAKE_SOURCE_DIR}/ThirdLibs/install")
+set(TENSORBOARD_LOGGER_DIR "${GPS_DEPS_PREFIX}")
 find_package(tensorboard_logger REQUIRED REQUIRED HINTS ${TENSORBOARD_LOGGER_DIR})
-set(Protobuf_LIBRARIES "/usr/lib/x86_64-linux-gnu/libprotobuf.so")
+# Keep the Protobuf library selected by find_package.
 message(STATUS "Protobuf_VERSION: ${Protobuf_VERSION}")
 message(STATUS "Protobuf_INCLUDE_DIRS: ${Protobuf_INCLUDE_DIRS}")
 message(STATUS "Protobuf_LIBRARIES: ${Protobuf_LIBRARIES}")
@@ -174,7 +175,7 @@ set(RASTERIZER_LIBS rasterizer)
 file(GLOB RASTERIZER_SRC_FILES ${PROJECT_SOURCE_DIR}/gsplat/rasterizer/*.cu ${PROJECT_SOURCE_DIR}/gsplat/rasterizer/*.cuh)
 
 add_library(rasterizer ${RASTERIZER_SRC_FILES})
-target_link_libraries(rasterizer PUBLIC cuda)
+target_link_libraries(rasterizer PUBLIC CUDA::cuda_driver)
 target_include_directories(rasterizer PRIVATE
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
     ${TORCH_INCLUDE_DIRS}
@@ -219,17 +220,17 @@ target_link_libraries(slam_trainer PUBLIC
         indicators::indicators
         tinyply
         tensorboard_logger
-        libyaml-cpp.a
+        "${GPS_DEPS_PREFIX}/lib/libyaml-cpp.a"
         ${Protobuf_LIBRARIES}
         InputSource 
         ITMLib 
         MiniSlamGraphLib 
         ORUtils 
         FernRelocLib 
-        cuda
+        CUDA::cuda_driver
         ${NVML_LIBRARY}
         ${OPENGL_LIBRARY}
-        glut
+        ${GLUT_LIBRARY}
 )
 target_include_directories(slam_trainer PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -246,17 +247,17 @@ target_link_libraries(remote_viewer PUBLIC
         indicators::indicators
         tinyply
         tensorboard_logger
-        libyaml-cpp.a
+        "${GPS_DEPS_PREFIX}/lib/libyaml-cpp.a"
         ${Protobuf_LIBRARIES}
         InputSource 
         ITMLib 
         MiniSlamGraphLib 
         ORUtils 
         FernRelocLib 
-        cuda
+        CUDA::cuda_driver
         ${NVML_LIBRARY}
         ${OPENGL_LIBRARY}
-        glut
+        ${GLUT_LIBRARY}
 )
 target_include_directories(remote_viewer PRIVATE
     ${PROJECT_SOURCE_DIR}/include
@@ -280,3 +281,9 @@ if (MSVC)
 endif (MSVC)
 
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
+# GPS_COMPARE: offline full-sequence timing and native hybrid bouquet rendering
+add_executable(gps_compare gps_compare.cpp ${OURS_SRC_FILES} ${SLAM_SRC_FILES})
+get_target_property(GPS_COMPARE_LIBS slam_trainer LINK_LIBRARIES)
+get_target_property(GPS_COMPARE_INCLUDES slam_trainer INCLUDE_DIRECTORIES)
+target_link_libraries(gps_compare PRIVATE ${GPS_COMPARE_LIBS})
+target_include_directories(gps_compare PRIVATE ${GPS_COMPARE_INCLUDES})

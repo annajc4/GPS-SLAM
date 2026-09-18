@@ -16,7 +16,7 @@ OPTION(WITH_CUDA "Build with CUDA support?" ${CUDAToolkit_FOUND})
 
 IF(WITH_CUDA)
   message(STATUS "Building with CUDA support")
-  SET(CMAKE_CUDA_ARCHITECTURES 70;75;80)
+  SET(CMAKE_CUDA_ARCHITECTURES 120)
 
   # Auto-detect the CUDA compute capability.
   # SET(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
