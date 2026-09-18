@@ -72,6 +72,9 @@ void SLAMPipeline::SLAMTrainCams(SLAMGaussianModel &model, std::vector<Camera> &
         clock_gettime(CLOCK_MONOTONIC, &perFrame_start);
 #endif
         curr_frame_id = i;
+        // a paced client (the planner / mapper) delivers permission frame by frame, like a live camera;
+        // render requests are answered while waiting
+        waitForFramePermission(model, i);
         // 1. 执行TSDF Fusion
         assert(curr_frame_id == tsdf_engine->currentFrameNo);
         tsdf_engine->ProcessFrame();
@@ -132,6 +135,8 @@ void SLAMPipeline::SLAMTrainCams(SLAMGaussianModel &model, std::vector<Camera> &
 #ifdef LOG_PIPELINE_TIME
             clock_gettime(CLOCK_MONOTONIC, &checkError_end);
 #endif
+            // answer external render requests with the model as it is after this optimisation round
+            serveRenderRequests(model);
             // std::cout << "total gs num: " << model.getGaussianNum() << std::endl;
             // printf("gs scale mean/min/max: %f, %f, %f\n",
             //        std::get<0>(model.getRealScales().max(-1)).mean().item<float>(),
@@ -189,7 +194,48 @@ void SLAMPipeline::loadConfig(const YAML::Node &config, const std::string &works
     {
         createDirectory(workspace_dir + "/" + config["TSDF"]["saved_images"].as<std::string>(), true);
         createDirectory(workspace_dir + "/before_opt", true);
+        int render_service_port = config["render_service_port"] ? config["render_service_port"].as<int>() : 0;
+        if (render_service_port > 0)
+            render_service = std::make_unique<RenderService>(render_service_port);
     }
+}
+
+bool SLAMPipeline::renderForRequest(SLAMGaussianModel &model, const RenderRequest &req,
+                                    std::vector<uint8_t> &rgb, std::vector<float> &depth)
+{
+    // Same path as remote_viewer.cpp / renderEvalImgs: SDF raycast, then the Gaussian forward pass.
+    torch::NoGradGuard noGrad;
+    torch::Tensor c2w = torch::from_blob(const_cast<float *>(req.c2w), {4, 4}, torch::kFloat32).clone();
+    Camera cam(req.width, req.height, req.fx, req.fy, req.cx, req.cy, false, c2w);
+    TensorDict raycast_res = runRaycastByCam(cam, false);
+    torch::Tensor raycast_color = raycast_res["color_map"];
+    torch::Tensor raycast_depth = raycast_res["depth_map"]; // (H, W, 1) camera-z, metres
+    torch::Tensor rendered = raycast_color;                  // (H, W, 3) in [0, 1]
+    if (model.getGaussianNum() > 0)
+        rendered = torch::clamp(model.forward(cam, raycast_depth, raycast_color)["rgb"], 0, 1);
+    torch::Tensor rgb8 = (rendered.detach().cpu() * 255.0).round().clamp(0, 255).to(torch::kUInt8).contiguous();
+    torch::Tensor depth32 = raycast_depth.detach().cpu().to(torch::kFloat32).contiguous();
+    rgb.assign(rgb8.data_ptr<uint8_t>(), rgb8.data_ptr<uint8_t>() + rgb8.numel());
+    depth.assign(depth32.data_ptr<float>(), depth32.data_ptr<float>() + depth32.numel());
+    return true;
+}
+
+void SLAMPipeline::serveRenderRequests(SLAMGaussianModel &model)
+{
+    if (!render_service)
+        return;
+    render_service->poll([&](const RenderRequest &req, std::vector<uint8_t> &rgb, std::vector<float> &depth) {
+        return renderForRequest(model, req, rgb, depth);
+    });
+}
+
+void SLAMPipeline::waitForFramePermission(SLAMGaussianModel &model, int frame_id)
+{
+    if (!render_service)
+        return;
+    render_service->waitUntilAllowed(frame_id, [&](const RenderRequest &req, std::vector<uint8_t> &rgb, std::vector<float> &depth) {
+        return renderForRequest(model, req, rgb, depth);
+    });
 }
 
 void SLAMPipeline::localOptimize(SLAMGaussianModel &model)

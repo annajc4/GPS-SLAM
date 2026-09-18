@@ -1,7 +1,9 @@
 #include "pipeline.h"
 #include "slam_gs_model.h"
 #include "InfiniTAM_tools.h"
+#include "render_service.h"
 #include <deque>
+#include <memory>
 
 class SLAMPipeline : public Pipeline
 {
@@ -9,6 +11,13 @@ public:
     void loadConfig(const YAML::Node &config, const std::string &workspace_dir, bool is_train);
 
     void SLAMTrainCams(SLAMGaussianModel &model, std::vector<Camera> &cams);
+
+    // External render service (PIPE.render_service_port > 0): answer queued requests with the current
+    // model, and wait for a paced client's permission before each frame (none = run free).
+    void serveRenderRequests(SLAMGaussianModel &model);
+    void waitForFramePermission(SLAMGaussianModel &model, int frame_id);
+    bool renderForRequest(SLAMGaussianModel &model, const RenderRequest &req,
+                          std::vector<uint8_t> &rgb, std::vector<float> &depth);
 
     void localOptimize(SLAMGaussianModel &model);
 
@@ -91,4 +100,6 @@ public:
     float new_gs_sample_ratio;
     float empty_alpha_thres;
     float color_error_thres;
+
+    std::unique_ptr<RenderService> render_service; // null unless PIPE.render_service_port > 0
 };
