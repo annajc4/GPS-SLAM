@@ -281,7 +281,7 @@ if (MSVC)
 endif (MSVC)
 
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
-# GPS_COMPARE: offline full-sequence timing and native hybrid bouquet rendering
+# GPS_COMPARE: full-sequence training driver with timing (used by nvs-mapper, optionally with the render service)
 add_executable(gps_compare gps_compare.cpp ${OURS_SRC_FILES} ${SLAM_SRC_FILES})
 get_target_property(GPS_COMPARE_LIBS slam_trainer LINK_LIBRARIES)
 get_target_property(GPS_COMPARE_INCLUDES slam_trainer INCLUDE_DIRECTORIES)

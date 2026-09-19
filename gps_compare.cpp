@@ -106,9 +106,6 @@ static void train(const YAML::Node &config, const std::string &configFile) {
     timing["reconstruction_seconds"] = reconstruction;
     timing["reconstruction_fps"] = expected / reconstruction;
     timing["gaussians"] = model.getGaussianNum();
-    timing["offline_refinement_seconds"] = 0;
-    timing["bouquet_rendering_seconds"] = 0;
-    timing["radio_seconds"] = 0;
     timing["scope"] = "Synchronized full native SLAMTrainCams call, including its logging; excludes input preload, setup, saving, and offline rendering";
 
     phase = Clock::now();
