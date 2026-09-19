@@ -63,7 +63,7 @@ int RenderService::poll(const Handler &handler)
                     served++;
                 }
             }
-            else if (std::memcmp(magic, "FIT1", 4) == 0)
+            else if (std::memcmp(magic, "FIT2", 4) == 0)
             {
                 int32_t head[2] = {fit_round_, static_cast<int32_t>(fit_maps_.size())};
                 bool sent = writeAll(fd, head, sizeof(head));
@@ -71,7 +71,8 @@ int RenderService::poll(const Handler &handler)
                 {
                     const FitMap &m = fit_maps_[i];
                     int32_t info[3] = {m.frame_id, m.width, m.height};
-                    sent = writeAll(fd, info, sizeof(info)) && writeAll(fd, m.ssim.data(), m.ssim.size() * sizeof(float));
+                    sent = writeAll(fd, info, sizeof(info)) && writeAll(fd, m.ssim.data(), m.ssim.size() * sizeof(float)) &&
+                           writeAll(fd, m.depth.data(), m.depth.size() * sizeof(float));
                 }
                 if (sent)
                     served++;

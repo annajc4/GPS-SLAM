@@ -234,12 +234,19 @@ void SLAMPipeline::updateFitMaps(SLAMGaussianModel &model)
         Camera cam = opt_cam_list[i];
         auto render_res = model.forward(cam, opt_raycast_list[i]["depth_map"], opt_raycast_list[i]["color_map"]);
         torch::Tensor ssim = model.ssimMap(render_res, cam); // (H, W)
-        ssim = ssim.slice(0, 0, ssim.size(0), stride).slice(1, 0, ssim.size(1), stride).to(torch::kFloat32).cpu().contiguous();
+        // the fused surface as this picture sees it: camera-z metres, 0 = no surface
+        torch::Tensor sdf_depth = opt_raycast_list[i]["depth_map"].reshape({ssim.size(0), ssim.size(1)});
+        auto subsample = [&](const torch::Tensor &t) {
+            return t.slice(0, 0, t.size(0), stride).slice(1, 0, t.size(1), stride).to(torch::kFloat32).cpu().contiguous();
+        };
+        ssim = subsample(ssim);
+        sdf_depth = subsample(sdf_depth);
         FitMap m;
         m.frame_id = cam.id;
         m.width = static_cast<int32_t>(ssim.size(1));
         m.height = static_cast<int32_t>(ssim.size(0));
         m.ssim.assign(ssim.data_ptr<float>(), ssim.data_ptr<float>() + ssim.numel());
+        m.depth.assign(sdf_depth.data_ptr<float>(), sdf_depth.data_ptr<float>() + sdf_depth.numel());
         maps.push_back(std::move(m));
     }
     render_service->setFitMaps(curr_frame_id, std::move(maps));

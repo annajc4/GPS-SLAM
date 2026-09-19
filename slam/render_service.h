@@ -15,10 +15,12 @@
 //          reply  : int32 width, int32 height, uint8[h*w*3] RGB, float32[h*w] camera-z depth (metres)
 //   "PACE" pace   : int32 allowed_frame  (training may process frames <= allowed_frame; INT32_MAX = no limit)
 //          reply  : int32 current_frame  (the frame training is at or waiting to start)
-//   "FIT1" fit    : (no body)
+//   "FIT2" fit    : (no body)
 //          reply  : int32 round_frame (frame of the latest optimisation round, -1 = none yet), int32 count, then per
 //                   picture trained on in that round: int32 frame_id, int32 width, int32 height,
-//                   float32[h*w] SSIM of the model's render against the picture (subsampled, row-major)
+//                   float32[h*w] SSIM of the model's render against the picture,
+//                   float32[h*w] SDF raycast depth from the picture's pose (camera-z metres, 0 = no surface);
+//                   both subsampled (every 3rd pixel), row-major
 #pragma once
 #include <cstdint>
 #include <functional>
@@ -37,7 +39,8 @@ struct RenderRequest
 struct FitMap
 {
     int32_t frame_id = -1, width = 0, height = 0;
-    std::vector<float> ssim; // height * width, row-major
+    std::vector<float> ssim;  // height * width, row-major
+    std::vector<float> depth; // SDF raycast depth from the picture's pose, same layout
 };
 
 class RenderService
@@ -59,7 +62,7 @@ public:
     // released, so no render can contain frames the client has not seen.
     void waitUntilAllowed(int frame, const Handler &handler);
 
-    // The pictures of the latest optimisation round with their fit; served on "FIT1" until replaced.
+    // The pictures of the latest optimisation round with their fit; served on "FIT2" until replaced.
     void setFitMaps(int32_t round_frame, std::vector<FitMap> maps)
     {
         fit_round_ = round_frame;
