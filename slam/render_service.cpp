@@ -63,6 +63,19 @@ int RenderService::poll(const Handler &handler)
                     served++;
                 }
             }
+            else if (std::memcmp(magic, "FIT1", 4) == 0)
+            {
+                int32_t head[2] = {fit_round_, static_cast<int32_t>(fit_maps_.size())};
+                bool sent = writeAll(fd, head, sizeof(head));
+                for (size_t i = 0; sent && i < fit_maps_.size(); i++)
+                {
+                    const FitMap &m = fit_maps_[i];
+                    int32_t info[3] = {m.frame_id, m.width, m.height};
+                    sent = writeAll(fd, info, sizeof(info)) && writeAll(fd, m.ssim.data(), m.ssim.size() * sizeof(float));
+                }
+                if (sent)
+                    served++;
+            }
             else if (std::memcmp(magic, "NVS1", 4) == 0)
             {
                 RenderRequest req;

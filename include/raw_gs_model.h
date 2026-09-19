@@ -55,6 +55,9 @@ public:
     // 根据前向结果计算误差
     TensorDict computeLoss(TensorDict &render_res, const Camera &cam, const YAML::Node &weight_configs, const torch::Tensor &mask = torch::Tensor());
 
+    // Per-pixel SSIM (H, W) of the render against this camera's picture: how well the model reproduces it
+    torch::Tensor ssimMap(TensorDict &render_res, const Camera &cam);
+
     // 进行训练后处理操作，记录梯度等信息用来densification
     void stepPostBackward(TensorDict &render_res, const Camera &cam, float scene_scale, int curr_iter);
 

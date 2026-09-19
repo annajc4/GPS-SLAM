@@ -416,6 +416,24 @@ TensorDict RawGaussianModel::computeLoss(TensorDict &render_res, const Camera &c
     return loss;
 }
 
+torch::Tensor RawGaussianModel::ssimMap(TensorDict &render_res, const Camera &cam)
+{
+    torch::Tensor gt_rgb = cam.image.to(device);
+    torch::Tensor rendered_rgb = torch::clamp(render_res["rgb"], 0, 1);
+    // same constants as computeLoss; "same" padding keeps the map at the image size
+    float C1 = 0.01 * 0.01;
+    float C2 = 0.03 * 0.03;
+    std::string padding = "same";
+    return FusedSSIMMap::apply(C1,
+                               C2,
+                               rendered_rgb.permute({2, 0, 1}).unsqueeze(0),
+                               gt_rgb.permute({2, 0, 1}).unsqueeze(0),
+                               padding,
+                               false)
+        .mean(1)
+        .squeeze(0);
+}
+
 void RawGaussianModel::stepPostBackward(TensorDict &render_res, const Camera &cam, float scene_scale, int curr_iter)
 {
     torch::NoGradGuard noGrad;

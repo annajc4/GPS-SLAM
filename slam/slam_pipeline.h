@@ -16,6 +16,8 @@ public:
     // model, and wait for a paced client's permission before each frame (none = run free).
     void serveRenderRequests(SLAMGaussianModel &model);
     void waitForFramePermission(SLAMGaussianModel &model, int frame_id);
+    // After an optimisation round: per-pixel SSIM of every picture of the round, handed to the render service.
+    void updateFitMaps(SLAMGaussianModel &model);
     bool renderForRequest(SLAMGaussianModel &model, const RenderRequest &req,
                           std::vector<uint8_t> &rgb, std::vector<float> &depth);
 

@@ -135,6 +135,8 @@ void SLAMPipeline::SLAMTrainCams(SLAMGaussianModel &model, std::vector<Camera> &
 #ifdef LOG_PIPELINE_TIME
             clock_gettime(CLOCK_MONOTONIC, &checkError_end);
 #endif
+            // how well the model now reproduces the pictures it just trained on (read by the render service's client)
+            updateFitMaps(model);
             // answer external render requests with the model as it is after this optimisation round
             serveRenderRequests(model);
             // std::cout << "total gs num: " << model.getGaussianNum() << std::endl;
@@ -218,6 +220,29 @@ bool SLAMPipeline::renderForRequest(SLAMGaussianModel &model, const RenderReques
     rgb.assign(rgb8.data_ptr<uint8_t>(), rgb8.data_ptr<uint8_t>() + rgb8.numel());
     depth.assign(depth32.data_ptr<float>(), depth32.data_ptr<float>() + depth32.numel());
     return true;
+}
+
+void SLAMPipeline::updateFitMaps(SLAMGaussianModel &model)
+{
+    if (!render_service || model.getGaussianNum() == 0)
+        return;
+    torch::NoGradGuard noGrad;
+    const int stride = 3; // the client samples depth every 3rd pixel; a finer map would not be used
+    std::vector<FitMap> maps;
+    for (size_t i = 0; i < opt_cam_list.size(); i++)
+    {
+        Camera cam = opt_cam_list[i];
+        auto render_res = model.forward(cam, opt_raycast_list[i]["depth_map"], opt_raycast_list[i]["color_map"]);
+        torch::Tensor ssim = model.ssimMap(render_res, cam); // (H, W)
+        ssim = ssim.slice(0, 0, ssim.size(0), stride).slice(1, 0, ssim.size(1), stride).to(torch::kFloat32).cpu().contiguous();
+        FitMap m;
+        m.frame_id = cam.id;
+        m.width = static_cast<int32_t>(ssim.size(1));
+        m.height = static_cast<int32_t>(ssim.size(0));
+        m.ssim.assign(ssim.data_ptr<float>(), ssim.data_ptr<float>() + ssim.numel());
+        maps.push_back(std::move(m));
+    }
+    render_service->setFitMaps(curr_frame_id, std::move(maps));
 }
 
 void SLAMPipeline::serveRenderRequests(SLAMGaussianModel &model)
