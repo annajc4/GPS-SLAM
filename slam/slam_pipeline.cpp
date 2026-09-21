@@ -49,6 +49,105 @@ public:
     }
 };
 
+// One int64 name per 3D point: the integer coordinates of the cell it falls in, packed like the planner's pack().
+static torch::Tensor cellKeys(const torch::Tensor &points, float cell)
+{
+    torch::Tensor ijk = torch::floor(points / cell).to(torch::kInt64) + (int64_t(1) << 20);
+    return ijk.select(1, 0) * (int64_t(1) << 42) + ijk.select(1, 1) * (int64_t(1) << 21) + ijk.select(1, 2);
+}
+
+// True where a cell was seen through by enough keyframes and no keyframe ever saw a surface in it.
+torch::Tensor SLAMPipeline::isFreeCell(const torch::Tensor &keys)
+{
+    if (free_keys.numel() == 0)
+        return torch::zeros_like(keys, torch::kBool);
+    torch::Tensor at = torch::searchsorted(free_keys, keys).clamp_max(free_keys.size(0) - 1);
+    return (free_keys.index({at}) == keys) & (free_views.index({at}) >= free_space_min_views) & ~free_surface.index({at});
+}
+
+// World-space ray of every stride-th pixel, scaled so that  point = centre + ray * depth  (depth = camera-z, metres).
+// Also gives those pixels' depths, flattened row by row.
+static torch::Tensor worldRays(const Camera &cam, int stride, torch::Device device, torch::Tensor &z)
+{
+    auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    torch::Tensor u = torch::arange(0, cam.width, stride, opts);
+    torch::Tensor v = torch::arange(0, cam.height, stride, opts);
+    int64_t nu = u.size(0), nv = v.size(0);
+    torch::Tensor x = ((u - cam.cx) / cam.fx).unsqueeze(0).expand({nv, nu});
+    torch::Tensor y = ((v - cam.cy) / cam.fy).unsqueeze(1).expand({nv, nu});
+    torch::Tensor rays = torch::stack({x, y, torch::ones_like(x)}, -1).reshape({-1, 3});
+    z = cam.depth.to(device).squeeze(-1).index({torch::indexing::Slice(0, torch::indexing::None, stride), torch::indexing::Slice(0, torch::indexing::None, stride)}).reshape({-1});
+    torch::Tensor R = cam.c2w.to(device).index({torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3)});
+    return torch::matmul(rays, R.t());
+}
+
+void SLAMPipeline::carveFreeSpace(const Camera &cam)
+{
+    if (free_space_min_views <= 0)
+        return;
+    torch::NoGradGuard noGrad;
+    torch::Tensor z;
+    torch::Tensor rays = worldRays(cam, 4, device, z); // every 4th pixel: 2.4 cm apart at 3.5 m, finer than a cell
+    torch::Tensor valid = z > 0;
+    rays = rays.index({valid});
+    z = z.index({valid});
+    if (z.numel() == 0)
+        return;
+    torch::Tensor centre = cam.c2w.to(device).index({torch::indexing::Slice(0, 3), 3});
+
+    // cells a ray ended in
+    torch::Tensor ended = std::get<0>(torch::_unique(cellKeys(centre + rays * z.unsqueeze(1), free_cell)));
+    // cells a ray crossed: a sample every half cell of depth, from the near plane up to one truncation distance
+    // before the ray's own endpoint (where the band InfiniTAM writes begins), and no further than it fuses
+    float near = config["TSDF"]["viewFrustum_min"].as<float>(), far = config["TSDF"]["viewFrustum_max"].as<float>();
+    torch::Tensor t = torch::arange(near, far, free_cell / 2, z.options());
+    torch::Tensor inside = t.unsqueeze(0) <= (z - free_cell).unsqueeze(1);   // (rays, samples)
+    torch::Tensor samples = centre + rays.unsqueeze(1) * t.view({1, -1, 1}); // (rays, samples, 3)
+    torch::Tensor crossed = std::get<0>(torch::_unique(cellKeys(samples.index({inside}), free_cell)));
+
+    // merge into the store: +1 view for each crossed cell, the surface flag for each cell a ray ended in
+    auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(device);
+    torch::Tensor keys = torch::cat({free_keys, crossed, ended});
+    torch::Tensor views = torch::cat({free_views, torch::ones({crossed.size(0)}, i32), torch::zeros({ended.size(0)}, i32)});
+    torch::Tensor surface = torch::cat({free_surface.to(torch::kInt32), torch::zeros({crossed.size(0)}, i32), torch::ones({ended.size(0)}, i32)});
+    auto merged = torch::_unique2(keys, true, true);
+    free_keys = std::get<0>(merged);
+    torch::Tensor row = std::get<1>(merged);
+    free_views = torch::zeros({free_keys.size(0)}, i32).index_add_(0, row, views);
+    free_surface = torch::zeros({free_keys.size(0)}, i32).index_add_(0, row, surface) > 0;
+    printf("[FREE SPACE] keyframe %d: %ld cells, %ld free\n", curr_frame_id, (long)free_keys.size(0),
+           (long)((free_views >= free_space_min_views) & ~free_surface).sum().item<int64_t>());
+}
+
+// Before a frame is fused: blank the depth pixels that land in remembered free space. Returns how many.
+int SLAMPipeline::vetoFreeSpace(Camera &cam)
+{
+    if (free_space_min_views <= 0 || free_keys.numel() == 0)
+        return 0;
+    torch::NoGradGuard noGrad;
+    torch::Tensor z;
+    torch::Tensor rays = worldRays(cam, 1, device, z); // every pixel
+    torch::Tensor centre = cam.c2w.to(device).index({torch::indexing::Slice(0, 3), 3});
+    // InfiniTAM would write a band of one truncation distance either side of the depth: a pixel is blanked only
+    // if both its endpoint and the far edge of that band lie in free cells
+    torch::Tensor veto = (z > 0) & isFreeCell(cellKeys(centre + rays * z.unsqueeze(1), free_cell)) &
+                         isFreeCell(cellKeys(centre + rays * (z + free_cell).unsqueeze(1), free_cell));
+    int blanked = veto.sum().item<int>();
+    if (blanked == 0)
+        return 0;
+    veto = veto.cpu();
+    // the copy InfiniTAM fuses
+    short *raw = tsdf_engine->depthData(curr_frame_id);
+    const bool *flag = veto.data_ptr<bool>();
+    for (int64_t p = 0; p < veto.numel(); p++)
+        if (flag[p])
+            raw[p] = 0;
+    // the copy the pipeline keeps: keyframe carving reads it, so a blanked pixel neither carves nor marks a surface
+    cam.depth.masked_fill_(veto.view_as(cam.depth), 0);
+    printf("[FREE SPACE] frame %d: %d depth pixels not fused\n", curr_frame_id, blanked);
+    return blanked;
+}
+
 void SLAMPipeline::SLAMTrainCams(SLAMGaussianModel &model, std::vector<Camera> &cams)
 {
 #ifdef LOG_PIPELINE_TIME
@@ -77,6 +176,7 @@ void SLAMPipeline::SLAMTrainCams(SLAMGaussianModel &model, std::vector<Camera> &
         waitForFramePermission(model, i);
         // 1. 执行TSDF Fusion
         assert(curr_frame_id == tsdf_engine->currentFrameNo);
+        vetoFreeSpace(cams[i]);
         tsdf_engine->ProcessFrame();
 
         // std::cout << "gt" << std::endl;
@@ -192,6 +292,13 @@ void SLAMPipeline::loadConfig(const YAML::Node &config, const std::string &works
     keyframe_theta_thres = config["keyframe_theta_thres"].as<float>();
     keyframe_trans_thres = config["keyframe_trans_thres"].as<float>();
     log_slam_state = config["log_slam_state"].as<bool>();
+    free_space_min_views = config["free_space_min_views"] ? config["free_space_min_views"].as<int>() : 0;
+    free_cell = config["TSDF"]["trunc_dist"].as<float>();
+    if (free_space_min_views > 0 && !config["TSDF"]["use_gt_pose"].as<bool>())
+        throw std::runtime_error("free_space_min_views needs supplied poses: a frame is checked before it is tracked");
+    free_keys = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+    free_views = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+    free_surface = torch::empty({0}, torch::TensorOptions().dtype(torch::kBool).device(device));
     if (is_train)
     {
         createDirectory(workspace_dir + "/" + config["TSDF"]["saved_images"].as<std::string>(), true);
@@ -431,6 +538,7 @@ void SLAMPipeline::updateFrameList()
         keyframe_cam_list.push_back(curr_cam);
         keyframe_cam_dict[curr_cam.getFrameID()] = curr_cam;
         keyframe_loss_dict[curr_cam.getFrameID()] = {0.1, float(curr_frame_id), 0, 0, 0};
+        carveFreeSpace(curr_cam);
     }
     // std::cout << localframe_raycast_window[0]["color_map"][100][200] << std::endl;
     // std::cout << localframe_raycast_window[0]["vertex_map"][100][200] << std::endl;
@@ -623,6 +731,40 @@ void SLAMPipeline::keyFrameRaycast(SLAMGaussianModel &model)
             auto sample = data_loader.getNext();
             auto cam = sample.value;
             auto cam_idx = sample.originalIndex;
+            auto keyframe_raycast_res = runRaycastByCam(cam, false);
+            opt_cam_list.emplace_back(cam);
+            opt_raycast_list.emplace_back(keyframe_raycast_res);
+        }
+    }
+    else if (config["keyframe_sample_configs"]["sample_method"].as<std::string>() == "overlap" && !keyframe_cam_list.empty())
+    {
+        // the keyframes that see the most of what the newest local frame sees
+        int global_select_num = std::min(keyframe_select_max, int(keyframe_cam_list.size()));
+        float trunc = config["TSDF"]["trunc_dist"].as<float>();
+        // SDF surface points of the newest local frame (world, metres): every 8th pixel, empty pixels dropped
+        torch::Tensor points = localframe_raycast_window.back()["vertex_map"]
+                                   .index({torch::indexing::Slice(0, torch::indexing::None, 8), torch::indexing::Slice(0, torch::indexing::None, 8)})
+                                   .reshape({-1, 3});
+        points = points.index({points.sum(1) != 0});
+        std::vector<torch::Tensor> seen;
+        for (const Camera &cam : keyframe_cam_list)
+        {
+            // the points in this keyframe's camera coordinates, then the pixel each one falls on
+            torch::Tensor c2w = cam.c2w.to(device);
+            torch::Tensor local = torch::matmul(points - c2w.index({torch::indexing::Slice(0, 3), 3}),
+                                                c2w.index({torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3)}));
+            torch::Tensor pz = local.select(1, 2);
+            torch::Tensor pu = torch::round(local.select(1, 0) / pz.clamp_min(1e-6) * cam.fx + cam.cx).to(torch::kInt64);
+            torch::Tensor pv = torch::round(local.select(1, 1) / pz.clamp_min(1e-6) * cam.fy + cam.cy).to(torch::kInt64);
+            torch::Tensor in_view = (pz > 0) & (pu >= 0) & (pu < cam.width) & (pv >= 0) & (pv < cam.height);
+            // not hidden: the keyframe's own depth at that pixel reaches at least as far as the point
+            torch::Tensor own = cam.depth.to(device).squeeze(-1).index({pv.clamp(0, cam.height - 1), pu.clamp(0, cam.width - 1)});
+            seen.push_back((in_view & (own > 0) & (pz <= own + trunc)).sum());
+        }
+        torch::Tensor best = std::get<1>(torch::stack(seen).topk(global_select_num)).cpu();
+        for (int i = 0; i < global_select_num; i++)
+        {
+            auto cam = keyframe_cam_list[best[i].item<int64_t>()];
             auto keyframe_raycast_res = runRaycastByCam(cam, false);
             opt_cam_list.emplace_back(cam);
             opt_raycast_list.emplace_back(keyframe_raycast_res);

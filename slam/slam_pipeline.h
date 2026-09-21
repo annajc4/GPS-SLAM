@@ -31,6 +31,14 @@ public:
 
     void initNewGaussians(SLAMGaussianModel &model, TensorDict &raycast_maps);
 
+    // Free-space memory (PIPE.free_space_min_views > 0). Space is cut into cells of one truncation distance,
+    // each named by its packed integer coordinates, so no scene bounds are needed.
+    // carve: at a keyframe, remember the cells its depth rays crossed and the cells they ended in.
+    // veto: before a frame is fused, blank the depth pixels that land in remembered free space.
+    void carveFreeSpace(const Camera &cam);
+    int vetoFreeSpace(Camera &cam);
+    torch::Tensor isFreeCell(const torch::Tensor &keys);
+
     void setTsdfEngine(CLIEngine *tsdf_engine)
     {
         this->tsdf_engine = tsdf_engine;
@@ -102,6 +110,12 @@ public:
     float new_gs_sample_ratio;
     float empty_alpha_thres;
     float color_error_thres;
+
+    int free_space_min_views = 0; // keyframes that must have seen through a cell before it counts as free; 0 = off
+    float free_cell;              // cell size = TSDF trunc_dist
+    torch::Tensor free_keys;      // (N,) int64, sorted: every cell a keyframe ray crossed or ended in
+    torch::Tensor free_views;     // (N,) int32: keyframes whose rays crossed the cell
+    torch::Tensor free_surface;   // (N,) bool: some keyframe ray ended in the cell
 
     std::unique_ptr<RenderService> render_service; // null unless PIPE.render_service_port > 0
 };

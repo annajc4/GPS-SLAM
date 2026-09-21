@@ -64,6 +64,10 @@ namespace InfiniTAM
             {
                 return mainEngine;
             }
+
+            // CPU depth buffer of one input frame, row-major. A pixel set to 0 here before ProcessFrame()
+            // is treated as "no depth": InfiniTAM fuses neither SDF nor colour for it.
+            short *depthData(int frame) { return depth_images[frame]->GetData(MEMORYDEVICE_CPU); }
         };
     }
 }
