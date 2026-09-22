@@ -39,6 +39,13 @@ public:
     int vetoFreeSpace(Camera &cam);
     torch::Tensor isFreeCell(const torch::Tensor &keys);
 
+    // Fit maps also for keyframes the round did not train on (PIPE.fit_reeval_max > 0): a keyframe is stale once its
+    // view overlaps a surface a round trained on, and the ones that have seen the most retrained surface since their
+    // last scoring are rendered and scored without training, so the client's readings follow the model's changes.
+    torch::Tensor keyframeOverlap(const torch::Tensor &points); // per keyframe: how many of the points it sees
+    int fit_reeval_max = 0;                                     // re-evaluated keyframes per round, 0 = off
+    std::map<int, int64_t> fit_stale;                           // keyframe list index -> trained-surface points seen since last scored
+
     void setTsdfEngine(CLIEngine *tsdf_engine)
     {
         this->tsdf_engine = tsdf_engine;

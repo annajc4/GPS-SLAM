@@ -1,6 +1,8 @@
 #include "slam_pipeline.h"
 #include "tensor_math.h"
+#include <algorithm>
 #include <cstdio>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -293,6 +295,7 @@ void SLAMPipeline::loadConfig(const YAML::Node &config, const std::string &works
     keyframe_trans_thres = config["keyframe_trans_thres"].as<float>();
     log_slam_state = config["log_slam_state"].as<bool>();
     free_space_min_views = config["free_space_min_views"] ? config["free_space_min_views"].as<int>() : 0;
+    fit_reeval_max = config["fit_reeval_max"] ? config["fit_reeval_max"].as<int>() : 0;
     free_cell = config["TSDF"]["trunc_dist"].as<float>();
     if (free_space_min_views > 0 && !config["TSDF"]["use_gt_pose"].as<bool>())
         throw std::runtime_error("free_space_min_views needs supplied poses: a frame is checked before it is tracked");
@@ -336,13 +339,12 @@ void SLAMPipeline::updateFitMaps(SLAMGaussianModel &model)
     torch::NoGradGuard noGrad;
     const int stride = 3; // the client samples depth every 3rd pixel; a finer map would not be used
     std::vector<FitMap> maps;
-    for (size_t i = 0; i < opt_cam_list.size(); i++)
-    {
-        Camera cam = opt_cam_list[i];
-        auto render_res = model.forward(cam, opt_raycast_list[i]["depth_map"], opt_raycast_list[i]["color_map"]);
+    // render one picture from the current model and score it against its real image
+    auto score = [&](const Camera &cam, TensorDict &raycast) {
+        auto render_res = model.forward(cam, raycast["depth_map"], raycast["color_map"]);
         torch::Tensor ssim = model.ssimMap(render_res, cam); // (H, W)
         // the fused surface as this picture sees it: camera-z metres, 0 = no surface
-        torch::Tensor sdf_depth = opt_raycast_list[i]["depth_map"].reshape({ssim.size(0), ssim.size(1)});
+        torch::Tensor sdf_depth = raycast["depth_map"].reshape({ssim.size(0), ssim.size(1)});
         auto subsample = [&](const torch::Tensor &t) {
             return t.slice(0, 0, t.size(0), stride).slice(1, 0, t.size(1), stride).to(torch::kFloat32).cpu().contiguous();
         };
@@ -355,6 +357,44 @@ void SLAMPipeline::updateFitMaps(SLAMGaussianModel &model)
         m.ssim.assign(ssim.data_ptr<float>(), ssim.data_ptr<float>() + ssim.numel());
         m.depth.assign(sdf_depth.data_ptr<float>(), sdf_depth.data_ptr<float>() + sdf_depth.numel());
         maps.push_back(std::move(m));
+    };
+    // the pictures the round trained on
+    for (size_t i = 0; i < opt_cam_list.size(); i++)
+        score(opt_cam_list[i], opt_raycast_list[i]);
+
+    if (fit_reeval_max > 0 && !keyframe_cam_list.empty())
+    {
+        // the surface the round trained on: every 16th pixel of each trained picture's SDF vertex map
+        std::vector<torch::Tensor> pts;
+        for (auto &raycast : opt_raycast_list)
+            pts.push_back(raycast["vertex_map"].index({torch::indexing::Slice(0, torch::indexing::None, 16), torch::indexing::Slice(0, torch::indexing::None, 16)}).reshape({-1, 3}));
+        torch::Tensor points = torch::cat(pts);
+        points = points.index({points.sum(1) != 0});
+        torch::Tensor overlap = keyframeOverlap(points).cpu();
+        auto seen = overlap.accessor<int64_t, 1>();
+        std::set<int> trained;
+        for (const Camera &cam : opt_cam_list)
+            trained.insert(cam.id);
+        // trained keyframes were just scored; every other keyframe adds the retrained surface it sees to its total
+        for (int k = 0; k < int(keyframe_cam_list.size()); k++)
+            if (trained.count(keyframe_cam_list[k].id))
+                fit_stale.erase(k);
+            else if (seen[k] > 0)
+                fit_stale[k] += seen[k];
+        // score the keyframes with the largest totals, and reset them
+        std::vector<std::pair<int64_t, int>> order;
+        for (const auto &[k, total] : fit_stale)
+            order.emplace_back(-total, k);
+        std::sort(order.begin(), order.end());
+        int n = std::min(fit_reeval_max, int(order.size()));
+        for (int i = 0; i < n; i++)
+        {
+            int k = order[i].second;
+            TensorDict raycast = runRaycastByCam(keyframe_cam_list[k], false);
+            score(keyframe_cam_list[k], raycast);
+            fit_stale.erase(k);
+        }
+        printf("[FIT] re-evaluated %d of %zu stale keyframes\n", n, order.size());
     }
     render_service->setFitMaps(curr_frame_id, std::move(maps));
 }
@@ -711,6 +751,29 @@ void SLAMPipeline::initNewGaussians(SLAMGaussianModel &model, TensorDict &raycas
 #endif
 }
 
+// For every keyframe: how many of the points (world, metres) it sees, i.e. they project inside its image and are not
+// hidden behind its own sensor depth. (K,) int64 on the device.
+torch::Tensor SLAMPipeline::keyframeOverlap(const torch::Tensor &points)
+{
+    float trunc = config["TSDF"]["trunc_dist"].as<float>();
+    std::vector<torch::Tensor> seen;
+    for (const Camera &cam : keyframe_cam_list)
+    {
+        // the points in this keyframe's camera coordinates, then the pixel each one falls on
+        torch::Tensor c2w = cam.c2w.to(device);
+        torch::Tensor local = torch::matmul(points - c2w.index({torch::indexing::Slice(0, 3), 3}),
+                                            c2w.index({torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3)}));
+        torch::Tensor pz = local.select(1, 2);
+        torch::Tensor pu = torch::round(local.select(1, 0) / pz.clamp_min(1e-6) * cam.fx + cam.cx).to(torch::kInt64);
+        torch::Tensor pv = torch::round(local.select(1, 1) / pz.clamp_min(1e-6) * cam.fy + cam.cy).to(torch::kInt64);
+        torch::Tensor in_view = (pz > 0) & (pu >= 0) & (pu < cam.width) & (pv >= 0) & (pv < cam.height);
+        // not hidden: the keyframe's own depth at that pixel reaches at least as far as the point
+        torch::Tensor own = cam.depth.to(device).squeeze(-1).index({pv.clamp(0, cam.height - 1), pu.clamp(0, cam.width - 1)});
+        seen.push_back((in_view & (own > 0) & (pz <= own + trunc)).sum());
+    }
+    return torch::stack(seen);
+}
+
 void SLAMPipeline::keyFrameRaycast(SLAMGaussianModel &model)
 {
     torch::NoGradGuard noGrad;
@@ -740,28 +803,12 @@ void SLAMPipeline::keyFrameRaycast(SLAMGaussianModel &model)
     {
         // the keyframes that see the most of what the newest local frame sees
         int global_select_num = std::min(keyframe_select_max, int(keyframe_cam_list.size()));
-        float trunc = config["TSDF"]["trunc_dist"].as<float>();
         // SDF surface points of the newest local frame (world, metres): every 8th pixel, empty pixels dropped
         torch::Tensor points = localframe_raycast_window.back()["vertex_map"]
                                    .index({torch::indexing::Slice(0, torch::indexing::None, 8), torch::indexing::Slice(0, torch::indexing::None, 8)})
                                    .reshape({-1, 3});
         points = points.index({points.sum(1) != 0});
-        std::vector<torch::Tensor> seen;
-        for (const Camera &cam : keyframe_cam_list)
-        {
-            // the points in this keyframe's camera coordinates, then the pixel each one falls on
-            torch::Tensor c2w = cam.c2w.to(device);
-            torch::Tensor local = torch::matmul(points - c2w.index({torch::indexing::Slice(0, 3), 3}),
-                                                c2w.index({torch::indexing::Slice(0, 3), torch::indexing::Slice(0, 3)}));
-            torch::Tensor pz = local.select(1, 2);
-            torch::Tensor pu = torch::round(local.select(1, 0) / pz.clamp_min(1e-6) * cam.fx + cam.cx).to(torch::kInt64);
-            torch::Tensor pv = torch::round(local.select(1, 1) / pz.clamp_min(1e-6) * cam.fy + cam.cy).to(torch::kInt64);
-            torch::Tensor in_view = (pz > 0) & (pu >= 0) & (pu < cam.width) & (pv >= 0) & (pv < cam.height);
-            // not hidden: the keyframe's own depth at that pixel reaches at least as far as the point
-            torch::Tensor own = cam.depth.to(device).squeeze(-1).index({pv.clamp(0, cam.height - 1), pu.clamp(0, cam.width - 1)});
-            seen.push_back((in_view & (own > 0) & (pz <= own + trunc)).sum());
-        }
-        torch::Tensor best = std::get<1>(torch::stack(seen).topk(global_select_num)).cpu();
+        torch::Tensor best = std::get<1>(keyframeOverlap(points).topk(global_select_num)).cpu();
         for (int i = 0; i < global_select_num; i++)
         {
             auto cam = keyframe_cam_list[best[i].item<int64_t>()];
